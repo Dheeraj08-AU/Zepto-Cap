@@ -1,7 +1,8 @@
 import os
+import json
 from typing import List, TypedDict
 from fastapi import FastAPI
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 import chromadb
 from chromadb.utils import embedding_functions
 from langgraph.graph import StateGraph, END
@@ -38,6 +39,14 @@ collection = chroma_client.get_or_create_collection(
     embedding_function=sentence_transformer_ef
 )
 
+class QueryRequest(BaseModel):
+    query: str
+
+class QueryResponse(BaseModel):
+    answer: str
+    sources: List[str]
+    confidence: float = Field(ge=0.0, le=1.0)
+
 class GraphState(TypedDict):
     query: str
     intent: str
@@ -46,20 +55,33 @@ class GraphState(TypedDict):
     answer: str
     confidence: float
 
+def execute_with_retry(llm_call_fn, max_retries: int = 2):
+    """Retries LLM response validation up to max_retries times on failure."""
+    for attempt in range(max_retries + 1):
+        try:
+            raw_response = llm_call_fn(attempt_number=attempt)
+            parsed = json.loads(raw_response)
+            validated = QueryResponse(**parsed)
+            return validated.dict()
+        except (json.JSONDecodeError, ValidationError) as e:
+            if attempt == max_retries:
+                return {
+                    "answer": "Error: Unable to generate a valid response after multiple attempts.",
+                    "sources": [],
+                    "confidence": 0.0
+                }
+
 def classify_intent(state: GraphState) -> GraphState:
     query = state["query"]
     mock_env = os.getenv("MOCK_LLM", "1")
     
+    keywords = ["delivery", "return", "refund", "membership", "tracking", "cancel", "gift card", "support hours"]
+    query_lower = query.lower()
+    
     if mock_env != "0":
-        keywords = ["delivery", "return", "refund", "membership", "tracking", "cancel", "gift card", "support hours"]
-        query_lower = query.lower()
-        if any(kw in query_lower for kw in keywords):
-            intent = "policy_question"
-        else:
-            intent = "general_question"
+        intent = "policy_question" if any(kw in query_lower for kw in keywords) else "general_question"
     else:
-        keywords = ["delivery", "return", "refund", "membership", "tracking", "cancel", "gift card", "support hours"]
-        intent = "policy_question" if any(kw in query.lower() for kw in keywords) else "general_question"
+        intent = "policy_question" if any(kw in query_lower for kw in keywords) else "general_question"
         
     return {**state, "intent": intent}
 
@@ -78,10 +100,18 @@ def retrieve_and_answer(state: GraphState) -> GraphState:
         sources = ids
         confidence = 1.0
     else:
-        top_snippet = docs[0][:200] if docs else ""
-        answer = f"Based on the retrieved context: {top_snippet}"
-        sources = ids
-        confidence = 1.0
+        def dummy_llm_call(attempt_number: int) -> str:
+            top_snippet = docs[0][:200] if docs else ""
+            return json.dumps({
+                "answer": f"Based on the retrieved context: {top_snippet}",
+                "sources": ids,
+                "confidence": 1.0
+            })
+            
+        res = execute_with_retry(dummy_llm_call)
+        answer = res["answer"]
+        sources = res["sources"]
+        confidence = res["confidence"]
         
     return {**state, "context": docs, "sources": sources, "answer": answer, "confidence": confidence}
 
@@ -118,14 +148,6 @@ workflow.add_edge("retrieve_and_answer", END)
 workflow.add_edge("direct_answer", END)
 
 app_graph = workflow.compile()
-
-class QueryRequest(BaseModel):
-    query: str
-
-class QueryResponse(BaseModel):
-    answer: str
-    sources: List[str]
-    confidence: float = Field(ge=0.0, le=1.0)
 
 app = FastAPI(title="Zepto Customer Support Assistant")
 
