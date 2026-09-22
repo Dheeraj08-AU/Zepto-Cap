@@ -1,6 +1,6 @@
 Zepto Capstone — End-to-End E-Commerce & GenAI Platform
+
 A unified platform combining automated data engineering, predictive machine learning, and an offline-first GenAI customer support service. Built to handle real-world quick-commerce workflows—from catalog database operations and customer analytics to routing complex policy queries using grounded RAG pipelines.
----
 
 Project Structure
 
